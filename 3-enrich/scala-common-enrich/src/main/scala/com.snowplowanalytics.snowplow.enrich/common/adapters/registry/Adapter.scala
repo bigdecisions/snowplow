@@ -18,7 +18,10 @@ package adapters
 package registry
 
 // Apache URLEncodedUtils
+import com.snowplowanalytics.snowplow.enrich.common.adapters.registry.MandrillAdapter._
 import org.apache.http.NameValuePair
+import org.joda.time.{DateTime, DateTimeZone}
+import org.joda.time.format.DateTimeFormat
 
 // Iglu
 import iglu.client.{
@@ -34,15 +37,22 @@ import Scalaz._
 import org.json4s._
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
+import com.fasterxml.jackson.core.JsonParseException
 
 // This project
 import loaders.CollectorPayload
 import utils.{JsonUtils => JU}
 
+// errors
+import scala.util.control.NonFatal
+
 trait Adapter {
 
   // The Iglu schema URI for a Snowplow unstructured event
   private val UnstructEvent = SchemaKey("com.snowplowanalytics.snowplow", "unstruct_event", "jsonschema", "1-0-0").toSchemaUri
+
+  // The Iglu schema URI for a Snowplow custom contexts
+  private val Contexts = SchemaKey("com.snowplowanalytics.snowplow", "contexts", "jsonschema", "1-0-1").toSchemaUri
 
   // Signature for a Formatter function
   type FormatterFunc = (RawEventParameters) => JObject
@@ -52,6 +62,66 @@ trait Adapter {
 
   // The encoding type to be used
   val EventEncType = "UTF-8"
+
+  private val AcceptedQueryParameters = Set("nuid", "aid", "cv", "eid", "ttm", "url")
+
+  // Datetime format we need to convert timestamps to
+  val JsonSchemaDateTimeFormat = DateTimeFormat.forPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(DateTimeZone.UTC)
+
+  /**
+   * Returns an updated event JSON where
+   * all of the timestamp fields (tsFieldKey:_) have been
+   * changed to a valid JsonSchema date-time format
+   * and the "event":_type field has been removed
+   *
+   * @param json The event JSON which we need to
+   *        update values for
+   * @param eventOpt The event type as an Option[String]
+   *        which we are now going to remove from
+   *        the event JSON
+   * @param tsFieldKey the key name of the timestamp field
+   *                   which will be transformed
+   * @param toSeconds function which converts the numeric
+   *                  value of the key into a seconds past
+   *                  epoch format (e.g. x * 1000 for ms)
+   * @return the updated JSON with valid date-time
+   *         values in the tsFieldKey fields
+   */
+  private[registry] def cleanupJsonEventValues(json: JValue, eventOpt: Option[(String,String)], tsFieldKey: String, toSeconds: Long => Long): JValue = {
+
+    def toStringField(value: Long): JString = {
+      val dt: DateTime = new DateTime(toSeconds(value))
+      JString(JsonSchemaDateTimeFormat.print(dt))
+    }
+
+    val j1 = json transformField {
+      case (k, v) => {
+        if (k == tsFieldKey) {
+          v match {
+            case JInt(x) => {
+              try {
+                (k, toStringField(x.longValue()))
+              } catch {
+                case NonFatal(_) => (k, JInt(x))
+              }
+            }
+            case JString(x) => {
+              try {
+                (k, toStringField(x.toLong))
+              } catch {
+                case NonFatal(_) => (k, JString(x))
+              }
+            }
+          }
+        } else (k, v)
+      }
+    }
+
+    eventOpt match {
+      case Some((keyName, eventType)) => j1 removeField { _ == JField(keyName, eventType) }
+      case None                       => j1
+    }
+  }
 
   /**
    * Converts a CollectorPayload instance into raw events.
@@ -138,8 +208,34 @@ trait Adapter {
       "e"     -> "ue",
       "p"     -> parameters.getOrElse("p", platform), // Required field
       "ue_pr" -> json) ++
-    parameters.filterKeys(Set("nuid", "aid", "cv"))
+    parameters.filterKeys(AcceptedQueryParameters)
   }
+
+  /**
+   * Creates a Snowplow unstructured event by nesting
+   * the provided JValue in a self-describing envelope
+   * for the unstructured event.
+   *
+   * @param eventJson The event which we will nest
+   *        into the unstructured event
+   * @return the self-describing unstructured event
+   */
+  protected[registry] def toUnstructEvent(eventJson: JValue): JValue =
+    ("schema" -> UnstructEvent) ~
+    ("data"   -> eventJson)
+
+  /**
+   * Creates a Snowplow custom contexts entity by
+   * nesting the provided JValue in a self-describing
+   * envelope for the custom contexts.
+   *
+   * @param eventJson The event which we will nest
+   *        into the unstructured event
+   * @return the self-describing unstructured event
+   */
+  protected[registry] def toContexts(contextJson: JValue): JValue =
+    ("schema" -> Contexts) ~
+    ("data"   -> List(contextJson))
 
   /**
    * Fabricates a Snowplow unstructured event from
@@ -165,11 +261,10 @@ trait Adapter {
     eventJson: JValue, platform: String): RawEventParameters = {
 
     val json = compact {
-      ("schema" -> UnstructEvent) ~
-      ("data"   -> (
+      toUnstructEvent(
         ("schema" -> schema) ~
         ("data"   -> eventJson)
-      ))
+      )
     }
 
     Map(
@@ -177,7 +272,7 @@ trait Adapter {
       "e"     -> "ue",
       "p"     -> qsParams.getOrElse("p", platform), // Required field
       "ue_pr" -> json) ++
-    qsParams.filterKeys(Set("nuid", "aid", "cv", "url"))
+    qsParams.filterKeys(AcceptedQueryParameters)
   }
 
   /**
@@ -277,4 +372,23 @@ trait Adapter {
         }
       }
     }
+
+  /**
+   * Attempts to parse a json string into a JValue
+   * example: {"p":"app"} becomes JObject(List((p,JString(app))))
+   *
+   * @param jsonStr The string we want to parse into a JValue
+   * @return a Validated JValue or a NonEmptyList Failure
+   *         containing a JsonParseException
+   */
+  private[registry] def parseJsonSafe(jsonStr: String): Validated[JValue] =
+    try {
+      parse(jsonStr).successNel
+    } catch {
+      case e: JsonParseException => {
+        val exception = JU.stripInstanceEtc(e.toString).orNull
+        s"Event failed to parse into JSON: [${exception}]".failNel
+      }
+    }
+
 }
